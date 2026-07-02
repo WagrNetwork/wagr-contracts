@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/escrow", "crates/resolver", "crates/payout"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Wagr Protocol Contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+soroban-sdk = "20.5.0"
+soroban-spec-tools = "20.5.0"
