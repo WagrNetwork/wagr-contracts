@@ -51,6 +51,8 @@ Live on Stellar testnet (deployed 2026-11-08 from the [Deploy testnet](./.github
 | resolver | [`CDUPX7QW6KB56I5XXS5VOAPWQZNVYHHX7CDU2I3OKZFXHGQIRUPN7QNU`](https://stellar.expert/explorer/testnet/contract/CDUPX7QW6KB56I5XXS5VOAPWQZNVYHHX7CDU2I3OKZFXHGQIRUPN7QNU) |
 | payout | [`CDVRGTXC7MMUWN5SFNAOCCQCRDQWSTBX3O6LLIIDGBLWMFQT2X4PU4W4`](https://stellar.expert/explorer/testnet/contract/CDVRGTXC7MMUWN5SFNAOCCQCRDQWSTBX3O6LLIIDGBLWMFQT2X4PU4W4) |
 
+Try it in the browser with the [live demo app](https://wagrnetwork.github.io/wagr-app/) (Freighter on Testnet).
+
 Machine-readable record: [`deployments/testnet.json`](./deployments/testnet.json).
 
 ## Development
