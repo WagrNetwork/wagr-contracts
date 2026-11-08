@@ -9,8 +9,7 @@ authors = ["Wagr Protocol Contributors"]
 license = "MIT"
 
 [workspace.dependencies]
-soroban-sdk = "20.5.0"
-soroban-spec-tools = "20.5.0"
+soroban-sdk = "29.0.1"
 
 [profile.release]
 opt-level = "z"
