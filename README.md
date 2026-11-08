@@ -41,6 +41,18 @@ arbiter settles ──► payout ── escrow.release() ──► pot moved to 
 - Only registered oracles can submit results; a disputed result cannot auto-finalize.
 - Double settlement and double withdrawal are rejected.
 
+## Testnet deployment
+
+Live on Stellar testnet (deployed 2026-11-08 from the [Deploy testnet](./.github/workflows/deploy-testnet.yml) workflow, which also runs an on-chain smoke test: two players stake 1 XLM each, an oracle reports the result, the winner is settled from escrow and withdraws 1.99 XLM).
+
+| Contract | Address |
+| --- | --- |
+| escrow | [`CB7ZVZFLBIOMBQWTFNL4RMSULNHDZHD2WOYN3RFVXYGPQU7DZ327ETKY`](https://stellar.expert/explorer/testnet/contract/CB7ZVZFLBIOMBQWTFNL4RMSULNHDZHD2WOYN3RFVXYGPQU7DZ327ETKY) |
+| resolver | [`CDUPX7QW6KB56I5XXS5VOAPWQZNVYHHX7CDU2I3OKZFXHGQIRUPN7QNU`](https://stellar.expert/explorer/testnet/contract/CDUPX7QW6KB56I5XXS5VOAPWQZNVYHHX7CDU2I3OKZFXHGQIRUPN7QNU) |
+| payout | [`CDVRGTXC7MMUWN5SFNAOCCQCRDQWSTBX3O6LLIIDGBLWMFQT2X4PU4W4`](https://stellar.expert/explorer/testnet/contract/CDVRGTXC7MMUWN5SFNAOCCQCRDQWSTBX3O6LLIIDGBLWMFQT2X4PU4W4) |
+
+Machine-readable record: [`deployments/testnet.json`](./deployments/testnet.json).
+
 ## Development
 
 Prerequisites: Rust stable, the `wasm32v1-none` target, and [Stellar CLI](https://developers.stellar.org/docs/tools/cli) v25.2+ (soroban-sdk 29 requires it for WASM builds).
@@ -55,7 +67,7 @@ The `.wasm` files are written to `target/wasm32v1-none/release/`.
 
 ### Deploying to testnet
 
-With the [Stellar CLI](https://developers.stellar.org/docs/tools/cli) and a funded testnet identity:
+Run the **Deploy testnet** workflow from the Actions tab (optionally pass an admin address to hand control to), or run `scripts/deploy-testnet.sh` locally with Stellar CLI and `jq`. Manually, with a funded testnet identity:
 
 ```bash
 for c in escrow resolver payout; do
@@ -78,7 +90,6 @@ Open work is tracked in [issues](https://github.com/WagrNetwork/wagr-contracts/i
 - Migrate events to typed `#[contractevent]` structs
 - Let payout verify the resolver's finalized result on-chain instead of trusting the arbiter's winner
 - Multi-party (N-way) payout splits
-- Publish testnet deployment addresses
 
 ## Related
 
