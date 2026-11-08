@@ -1,6 +1,17 @@
 #![no_std]
+// Events still use `env.events().publish`; migrating to `#[contractevent]` types is tracked as an open issue.
+#![allow(deprecated)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    Symbol,
+};
+
+/// The part of the escrow contract's interface the payout contract calls.
+#[contractclient(name = "EscrowClient")]
+pub trait EscrowInterface {
+    fn release(env: Env, match_id: Symbol, recipient: Address) -> (Address, u128);
+}
 
 const BUMP_THRESHOLD: u32 = 518_400; // ~30 days at 5s/ledger
 const BUMP_EXTEND_TO: u32 = 535_680; // ~31 days at 5s/ledger
@@ -19,6 +30,10 @@ pub enum Error {
     AlreadyWithdrawn = 8,
     NoFees = 9,
     Unauthorized = 10,
+    EscrowNotSet = 11,
+    PotMismatch = 12,
+    AssetMismatch = 13,
+    SamePlayer = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,6 +44,8 @@ pub enum DataKey {
     Arbiter, // Only the arbiter (the resolver/settlement authority) can settle matches
     FeeBps,
     IsPaused,
+    /// Escrow contract that holds the stakes this contract settles.
+    Escrow,
 }
 
 #[contract]
@@ -43,11 +60,48 @@ fn settled_key(env: &Env, match_id: &Symbol) -> (Symbol, Symbol) {
 }
 
 fn winnings_key(env: &Env, match_id: &Symbol, player: &Address) -> (Symbol, Symbol, Address) {
-    (Symbol::new(env, "winnings"), match_id.clone(), player.clone())
+    (
+        Symbol::new(env, "winnings"),
+        match_id.clone(),
+        player.clone(),
+    )
 }
 
 fn withdrawn_key(env: &Env, match_id: &Symbol, player: &Address) -> (Symbol, Symbol, Address) {
-    (Symbol::new(env, "withdrawn"), match_id.clone(), player.clone())
+    (
+        Symbol::new(env, "withdrawn"),
+        match_id.clone(),
+        player.clone(),
+    )
+}
+
+fn match_asset_key(env: &Env, match_id: &Symbol) -> (Symbol, Symbol) {
+    (Symbol::new(env, "masset"), match_id.clone())
+}
+
+/// Pull the match pot out of escrow into this contract and check it matches
+/// what the arbiter claims. Settlement can never pay out more than was staked,
+/// or in a different asset.
+fn pull_pot(env: &Env, match_id: &Symbol, total_pot: u128, asset: &Address) -> Result<(), Error> {
+    let escrow: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Escrow)
+        .ok_or(Error::EscrowNotSet)?;
+    let (released_asset, pot) =
+        EscrowClient::new(env, &escrow).release(match_id, &env.current_contract_address());
+    if released_asset != *asset {
+        return Err(Error::AssetMismatch);
+    }
+    if pot != total_pot {
+        return Err(Error::PotMismatch);
+    }
+    let key = match_asset_key(env, match_id);
+    env.storage().persistent().set(&key, asset);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND_TO);
+    Ok(())
 }
 
 fn require_admin(env: &Env) -> Result<Address, Error> {
@@ -128,9 +182,16 @@ impl PayoutContract {
         require_not_paused(&env)?;
 
         let skey = settled_key(&env, &match_id);
-        if env.storage().persistent().get::<_, bool>(&skey).unwrap_or(false) {
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&skey)
+            .unwrap_or(false)
+        {
             return Err(Error::AlreadySettled);
         }
+
+        pull_pot(&env, &match_id, total_pot, &asset)?;
 
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let fee: u128 = (total_pot * fee_bps as u128) / 10000;
@@ -173,13 +234,23 @@ impl PayoutContract {
         require_not_paused(&env)?;
 
         let skey = settled_key(&env, &match_id);
-        if env.storage().persistent().get::<_, bool>(&skey).unwrap_or(false) {
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&skey)
+            .unwrap_or(false)
+        {
             return Err(Error::AlreadySettled);
         }
 
         if winner_split_bps > 10000 {
             return Err(Error::InvalidSplit);
         }
+        if winner == loser {
+            return Err(Error::SamePlayer);
+        }
+
+        pull_pot(&env, &match_id, total_pot, &asset)?;
 
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let fee: u128 = (total_pot * fee_bps as u128) / 10000;
@@ -216,15 +287,39 @@ impl PayoutContract {
     }
 
     /// Withdraw winnings for a player.
-    pub fn withdraw_winnings(env: Env, match_id: Symbol, player: Address, asset: Address) -> Result<u128, Error> {
+    pub fn withdraw_winnings(
+        env: Env,
+        match_id: Symbol,
+        player: Address,
+        asset: Address,
+    ) -> Result<u128, Error> {
         player.require_auth();
 
         let wkey = winnings_key(&env, &match_id, &player);
-        let amount: u128 = env.storage().persistent().get(&wkey).ok_or(Error::NoWinnings)?;
+        let amount: u128 = env
+            .storage()
+            .persistent()
+            .get(&wkey)
+            .ok_or(Error::NoWinnings)?;
 
         let dkey = withdrawn_key(&env, &match_id, &player);
-        if env.storage().persistent().get::<_, bool>(&dkey).unwrap_or(false) {
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&dkey)
+            .unwrap_or(false)
+        {
             return Err(Error::AlreadyWithdrawn);
+        }
+
+        // Winnings are paid only in the asset the match was settled in.
+        let settled_asset: Address = env
+            .storage()
+            .persistent()
+            .get(&match_asset_key(&env, &match_id))
+            .ok_or(Error::NoWinnings)?;
+        if settled_asset != asset {
+            return Err(Error::AssetMismatch);
         }
 
         let token = soroban_sdk::token::Client::new(&env, &asset);
@@ -236,6 +331,14 @@ impl PayoutContract {
             .publish(("payout", "withdrawn", match_id), (player, amount));
 
         Ok(amount)
+    }
+
+    /// Point this contract at the escrow contract it settles from (admin only).
+    /// The escrow contract must in turn name this contract as its settler.
+    pub fn set_escrow(env: Env, escrow: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Escrow, &escrow);
+        Ok(())
     }
 
     /// Withdraw accumulated fees (fee collector only).
@@ -297,7 +400,9 @@ impl PayoutContract {
     /// Set the arbiter, the sole authority permitted to settle matches (admin only).
     pub fn set_arbiter(env: Env, new_arbiter: Address) -> Result<(), Error> {
         require_admin(&env)?;
-        env.storage().instance().set(&DataKey::Arbiter, &new_arbiter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Arbiter, &new_arbiter);
         Ok(())
     }
 
@@ -343,62 +448,146 @@ impl PayoutContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use escrow::{EscrowContract, EscrowContractClient};
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
+    use soroban_sdk::{token, Env};
 
-    #[test]
-    fn test_initialize() {
+    struct Setup<'a> {
+        env: Env,
+        payout: PayoutContractClient<'a>,
+        escrow: EscrowContractClient<'a>,
+        asset: Address,
+        p1: Address,
+        p2: Address,
+        fee_collector: Address,
+    }
+
+    /// Escrow + payout wired together, a token, and a 2-player match "m1"
+    /// with 1_000 staked by each player.
+    fn setup<'a>() -> Setup<'a> {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, PayoutContract);
-        let client = PayoutContractClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
         let fee_collector = Address::generate(&env);
 
-        client.initialize(&admin, &fee_collector, &50);
+        let escrow_id = env.register(EscrowContract, ());
+        let payout_id = env.register(PayoutContract, ());
+        let escrow = EscrowContractClient::new(&env, &escrow_id);
+        let payout = PayoutContractClient::new(&env, &payout_id);
+        escrow.initialize(&admin, &fee_collector, &50);
+        payout.initialize(&admin, &fee_collector, &50);
+        escrow.set_settler(&payout_id);
+        payout.set_escrow(&escrow_id);
+
+        let asset = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let sac = token::StellarAssetClient::new(&env, &asset);
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        sac.mint(&p1, &10_000);
+        sac.mint(&p2, &10_000);
+
+        let m = Symbol::new(&env, "m1");
+        escrow.stake(&m, &p1, &1_000, &asset);
+        escrow.stake(&m, &p2, &1_000, &asset);
+
+        Setup {
+            env,
+            payout,
+            escrow,
+            asset,
+            p1,
+            p2,
+            fee_collector,
+        }
     }
 
     #[test]
-    fn test_winner_take_all_requires_arbiter_auth() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, PayoutContract);
-        let client = PayoutContractClient::new(&env, &contract_id);
+    fn test_winner_take_all_end_to_end() {
+        let s = setup();
+        let m = Symbol::new(&s.env, "m1");
+        let token = token::Client::new(&s.env, &s.asset);
 
-        let admin = Address::generate(&env);
-        let fee_collector = Address::generate(&env);
-        client.initialize(&admin, &fee_collector, &50);
+        s.payout
+            .resolve_winner_take_all(&m, &s.p1, &2_000, &s.asset);
+        assert_eq!(s.escrow.get_total_escrow(), 0);
 
-        let asset = Address::generate(&env);
-        let winner = Address::generate(&env);
-        let total_pot = 200_000_000u128;
-
-        let match_id = Symbol::new(&env, "match1");
-        client.resolve_winner_take_all(&match_id, &winner, &total_pot, &asset);
-
-        let fee_bps = 50u32;
-        let expected_fee = (total_pot * fee_bps as u128) / 10000;
-        assert_eq!(client.get_fee_balance(&asset), expected_fee);
+        // 0.5% fee on a 2_000 pot.
+        assert_eq!(s.payout.get_fee_balance(&s.asset), 10);
+        assert_eq!(s.payout.withdraw_winnings(&m, &s.p1, &s.asset), 1_990);
+        assert_eq!(token.balance(&s.p1), 10_000 - 1_000 + 1_990);
+        assert_eq!(s.payout.withdraw_fees(&s.asset), 10);
+        assert_eq!(token.balance(&s.fee_collector), 10);
+        assert_eq!(token.balance(&s.payout.address), 0);
     }
 
     #[test]
-    fn test_double_settle_rejected() {
+    fn test_split_end_to_end() {
+        let s = setup();
+        let m = Symbol::new(&s.env, "m1");
+        s.payout
+            .resolve_split(&m, &s.p1, &s.p2, &2_000, &7_000, &s.asset);
+        assert_eq!(s.payout.withdraw_winnings(&m, &s.p1, &s.asset), 1_393);
+        assert_eq!(s.payout.withdraw_winnings(&m, &s.p2, &s.asset), 597);
+    }
+
+    #[test]
+    fn test_arbiter_cannot_inflate_pot() {
+        let s = setup();
+        let m = Symbol::new(&s.env, "m1");
+        let res = s
+            .payout
+            .try_resolve_winner_take_all(&m, &s.p1, &5_000, &s.asset);
+        assert!(res.is_err());
+        // Nothing moved: the stakes are still in escrow.
+        assert_eq!(s.escrow.get_total_escrow(), 2_000);
+    }
+
+    #[test]
+    fn test_withdraw_rejects_other_asset() {
+        let s = setup();
+        let m = Symbol::new(&s.env, "m1");
+        s.payout
+            .resolve_winner_take_all(&m, &s.p1, &2_000, &s.asset);
+        let other = s
+            .env
+            .register_stellar_asset_contract_v2(Address::generate(&s.env))
+            .address();
+        let res = s.payout.try_withdraw_winnings(&m, &s.p1, &other);
+        assert_eq!(res, Err(Ok(Error::AssetMismatch)));
+    }
+
+    #[test]
+    fn test_double_settle_and_double_withdraw_rejected() {
+        let s = setup();
+        let m = Symbol::new(&s.env, "m1");
+        s.payout
+            .resolve_winner_take_all(&m, &s.p1, &2_000, &s.asset);
+        assert_eq!(
+            s.payout
+                .try_resolve_winner_take_all(&m, &s.p1, &2_000, &s.asset),
+            Err(Ok(Error::AlreadySettled))
+        );
+        s.payout.withdraw_winnings(&m, &s.p1, &s.asset);
+        assert_eq!(
+            s.payout.try_withdraw_winnings(&m, &s.p1, &s.asset),
+            Err(Ok(Error::AlreadyWithdrawn))
+        );
+    }
+
+    #[test]
+    fn test_settle_requires_escrow() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, PayoutContract);
-        let client = PayoutContractClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let fee_collector = Address::generate(&env);
-        client.initialize(&admin, &fee_collector, &50);
-
-        let asset = Address::generate(&env);
-        let winner = Address::generate(&env);
-        let match_id = Symbol::new(&env, "match1");
-
-        client.resolve_winner_take_all(&match_id, &winner, &200_000_000u128, &asset);
-        let result = client.try_resolve_winner_take_all(&match_id, &winner, &200_000_000u128, &asset);
-        assert!(result.is_err());
+        let payout = PayoutContractClient::new(&env, &env.register(PayoutContract, ()));
+        payout.initialize(&Address::generate(&env), &Address::generate(&env), &50);
+        let res = payout.try_resolve_winner_take_all(
+            &Symbol::new(&env, "m1"),
+            &Address::generate(&env),
+            &100,
+            &Address::generate(&env),
+        );
+        assert_eq!(res, Err(Ok(Error::EscrowNotSet)));
     }
 }
