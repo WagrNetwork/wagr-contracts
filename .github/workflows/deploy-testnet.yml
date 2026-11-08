@@ -1,0 +1,44 @@
+name: Deploy testnet
+
+on:
+  workflow_dispatch:
+    inputs:
+      admin_address:
+        description: "Stellar address (G...) that becomes admin, oracle, arbiter and fee collector after the smoke test. Leave empty to keep the throwaway deployer key."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      - uses: stellar/stellar-cli@v28.1.0
+      - name: Build WASM
+        run: stellar contract build
+      - name: Deploy, wire and smoke test
+        env:
+          ADMIN_ADDRESS: ${{ inputs.admin_address }}
+        run: bash scripts/deploy-testnet.sh
+      - name: Summary
+        run: |
+          {
+            echo "## Testnet deployment"
+            echo '```json'
+            cat deployments/testnet.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit deployment record
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deployments/testnet.json
+          git commit -m "chore: record testnet deployment [skip ci]"
+          git push
