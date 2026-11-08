@@ -43,12 +43,12 @@ arbiter settles ──► payout ── escrow.release() ──► pot moved to 
 
 ## Development
 
-Prerequisites: Rust stable and the `wasm32v1-none` target.
+Prerequisites: Rust stable, the `wasm32v1-none` target, and [Stellar CLI](https://developers.stellar.org/docs/tools/cli) v25.2+ (soroban-sdk 29 requires it for WASM builds).
 
 ```bash
 rustup target add wasm32v1-none
-cargo test                                      # run all contract tests
-cargo build --target wasm32v1-none --release    # build the three .wasm files
+cargo test               # run all contract tests
+stellar contract build   # build the three .wasm files
 ```
 
 The `.wasm` files are written to `target/wasm32v1-none/release/`.
