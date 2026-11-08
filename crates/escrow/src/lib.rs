@@ -1,4 +1,6 @@
 #![no_std]
+// Events still use `env.events().publish`; migrating to `#[contractevent]` types is tracked as an open issue.
+#![allow(deprecated)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
@@ -26,6 +28,9 @@ pub enum Error {
     NotTimedOut = 9,
     NoStake = 10,
     Unauthorized = 11,
+    AssetMismatch = 12,
+    AlreadyReleased = 13,
+    SettlerNotSet = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +41,8 @@ pub enum DataKey {
     FeeBps,
     IsPaused,
     TotalEscrow,
+    /// Contract (normally the payout contract) allowed to release a match pot.
+    Settler,
 }
 
 #[contract]
@@ -50,7 +57,37 @@ fn stake_key(env: &Env, match_id: &Symbol, player: &Address) -> (Symbol, Symbol,
 }
 
 fn stake_time_key(env: &Env, match_id: &Symbol, player: &Address) -> (Symbol, Symbol, Address) {
-    (Symbol::new(env, "staketime"), match_id.clone(), player.clone())
+    (
+        Symbol::new(env, "staketime"),
+        match_id.clone(),
+        player.clone(),
+    )
+}
+
+fn asset_key(env: &Env, match_id: &Symbol) -> (Symbol, Symbol) {
+    (Symbol::new(env, "asset"), match_id.clone())
+}
+
+fn released_key(env: &Env, match_id: &Symbol) -> (Symbol, Symbol) {
+    (Symbol::new(env, "released"), match_id.clone())
+}
+
+fn is_released(env: &Env, match_id: &Symbol) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, bool>(&released_key(env, match_id))
+        .unwrap_or(false)
+}
+
+/// Every match is denominated in exactly one asset, fixed by the first stake.
+/// Rejects any call that names a different asset, so a match can never be
+/// paid out or refunded in a token other than the one that was deposited.
+fn check_asset(env: &Env, match_id: &Symbol, asset: &Address) -> Result<(), Error> {
+    let stored: Option<Address> = env.storage().persistent().get(&asset_key(env, match_id));
+    match stored {
+        Some(a) if a != *asset => Err(Error::AssetMismatch),
+        _ => Ok(()),
+    }
 }
 
 fn require_admin(env: &Env) -> Result<Address, Error> {
@@ -122,6 +159,10 @@ impl EscrowContract {
         if amount == 0 {
             return Err(Error::ZeroAmount);
         }
+        if is_released(&env, &match_id) {
+            return Err(Error::AlreadyReleased);
+        }
+        check_asset(&env, &match_id, &asset)?;
 
         let pkey = players_key(&env, &match_id);
         let mut players: Vec<Address> = env
@@ -139,11 +180,21 @@ impl EscrowContract {
 
         // Transfer asset from player to this contract.
         let token = soroban_sdk::token::Client::new(&env, &asset);
-        token.transfer(&player, &env.current_contract_address(), &(amount as i128));
+        token.transfer(&player, env.current_contract_address(), &(amount as i128));
+
+        let akey = asset_key(&env, &match_id);
+        if !env.storage().persistent().has(&akey) {
+            env.storage().persistent().set(&akey, &asset);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&akey, BUMP_THRESHOLD, BUMP_EXTEND_TO);
 
         players.push_back(player.clone());
         env.storage().persistent().set(&pkey, &players);
-        env.storage().persistent().extend_ttl(&pkey, BUMP_THRESHOLD, BUMP_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pkey, BUMP_THRESHOLD, BUMP_EXTEND_TO);
 
         let skey = stake_key(&env, &match_id, &player);
         env.storage().persistent().set(&skey, &amount);
@@ -177,7 +228,11 @@ impl EscrowContract {
     /// Query the staked balance for a player in a match.
     pub fn query_stake_balance(env: Env, match_id: Symbol, player: Address) -> Result<u128, Error> {
         let skey = stake_key(&env, &match_id, &player);
-        Ok(env.storage().persistent().get::<_, u128>(&skey).unwrap_or(0))
+        Ok(env
+            .storage()
+            .persistent()
+            .get::<_, u128>(&skey)
+            .unwrap_or(0))
     }
 
     /// List the players who have staked into a match so far.
@@ -210,6 +265,11 @@ impl EscrowContract {
         if caller != player && caller != admin {
             return Err(Error::Unauthorized);
         }
+        if is_released(&env, &match_id) {
+            return Err(Error::AlreadyReleased);
+        }
+        // Refund only in the asset that was actually staked.
+        check_asset(&env, &match_id, &asset)?;
 
         let skey = stake_key(&env, &match_id, &player);
         let amount: u128 = env
@@ -259,6 +319,92 @@ impl EscrowContract {
         env.events()
             .publish(("stake", "refunded", match_id), (player, amount));
 
+        Ok(())
+    }
+
+    /// Release the whole pot of a match to `recipient` (normally the payout
+    /// contract itself). Only the configured settler may call this, the match
+    /// needs at least `MIN_PLAYERS` stakes, and it can happen once. Returns
+    /// the asset and the pot size so the caller settles exactly what was held.
+    pub fn release(
+        env: Env,
+        match_id: Symbol,
+        recipient: Address,
+    ) -> Result<(Address, u128), Error> {
+        let settler: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Settler)
+            .ok_or(Error::SettlerNotSet)?;
+        settler.require_auth();
+        require_not_paused(&env)?;
+
+        if is_released(&env, &match_id) {
+            return Err(Error::AlreadyReleased);
+        }
+
+        let players: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&players_key(&env, &match_id))
+            .unwrap_or(Vec::new(&env));
+        if players.len() < MIN_PLAYERS {
+            return Err(Error::NotEnoughPlayers);
+        }
+
+        let asset: Address = env
+            .storage()
+            .persistent()
+            .get(&asset_key(&env, &match_id))
+            .ok_or(Error::NoStake)?;
+
+        let mut pot: u128 = 0;
+        for p in players.iter() {
+            let skey = stake_key(&env, &match_id, &p);
+            pot += env
+                .storage()
+                .persistent()
+                .get::<_, u128>(&skey)
+                .unwrap_or(0);
+            env.storage().persistent().remove(&skey);
+            env.storage()
+                .persistent()
+                .remove(&stake_time_key(&env, &match_id, &p));
+        }
+
+        let rkey = released_key(&env, &match_id);
+        env.storage().persistent().set(&rkey, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rkey, BUMP_THRESHOLD, BUMP_EXTEND_TO);
+
+        let token = soroban_sdk::token::Client::new(&env, &asset);
+        token.transfer(&env.current_contract_address(), &recipient, &(pot as i128));
+
+        let total: u128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalEscrow)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalEscrow, &total.saturating_sub(pot));
+
+        env.events()
+            .publish(("stake", "released", match_id), (recipient, pot));
+
+        Ok((asset, pot))
+    }
+
+    /// The asset a match is denominated in (set by its first stake).
+    pub fn get_match_asset(env: Env, match_id: Symbol) -> Option<Address> {
+        env.storage().persistent().get(&asset_key(&env, &match_id))
+    }
+
+    /// Set the settler allowed to call `release` (admin only).
+    pub fn set_settler(env: Env, settler: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Settler, &settler);
         Ok(())
     }
 
@@ -338,7 +484,9 @@ mod tests {
         env: &Env,
         admin: &Address,
     ) -> (Address, soroban_sdk::token::StellarAssetClient<'a>) {
-        let contract_address = env.register_stellar_asset_contract(admin.clone());
+        let contract_address = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
         let asset_client = soroban_sdk::token::StellarAssetClient::new(env, &contract_address);
         (contract_address, asset_client)
     }
@@ -347,7 +495,7 @@ mod tests {
     fn test_initialize() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -360,7 +508,7 @@ mod tests {
     fn test_initialize_invalid_fee() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -374,7 +522,7 @@ mod tests {
     fn test_stake_and_query() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -397,7 +545,7 @@ mod tests {
     fn test_timeout_refund() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -412,17 +560,107 @@ mod tests {
         let match_id = Symbol::new(&env, "match1");
         client.stake(&match_id, &player, &100, &asset);
 
-        env.ledger().with_mut(|l| l.timestamp += LEDGER_TIMEOUT_SECS + 1);
+        env.ledger()
+            .with_mut(|l| l.timestamp += LEDGER_TIMEOUT_SECS + 1);
 
         client.timeout_refund(&match_id, &player, &player, &asset);
         assert_eq!(client.query_stake_balance(&match_id, &player), 0);
     }
 
     #[test]
+    fn test_refund_rejects_other_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &Address::generate(&env), &50);
+
+        // A real asset someone else staked, and a worthless one the attacker controls.
+        let (real, real_admin) = create_token(&env, &Address::generate(&env));
+        let (junk, junk_admin) = create_token(&env, &Address::generate(&env));
+        let victim = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        real_admin.mint(&victim, &1000);
+        junk_admin.mint(&attacker, &1000);
+
+        client.stake(&Symbol::new(&env, "m1"), &victim, &500, &real);
+        client.stake(&Symbol::new(&env, "m2"), &attacker, &500, &junk);
+        env.ledger()
+            .with_mut(|l| l.timestamp += LEDGER_TIMEOUT_SECS + 1);
+
+        let res = client.try_timeout_refund(&Symbol::new(&env, "m2"), &attacker, &attacker, &real);
+        assert_eq!(res, Err(Ok(Error::AssetMismatch)));
+    }
+
+    #[test]
+    fn test_stake_rejects_mixed_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&Address::generate(&env), &Address::generate(&env), &50);
+
+        let (a, a_admin) = create_token(&env, &Address::generate(&env));
+        let (b, b_admin) = create_token(&env, &Address::generate(&env));
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        a_admin.mint(&p1, &1000);
+        b_admin.mint(&p2, &1000);
+
+        let m = Symbol::new(&env, "m1");
+        client.stake(&m, &p1, &100, &a);
+        assert_eq!(
+            client.try_stake(&m, &p2, &100, &b),
+            Err(Ok(Error::AssetMismatch))
+        );
+    }
+
+    #[test]
+    fn test_release_moves_full_pot_once() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(&Address::generate(&env), &Address::generate(&env), &50);
+        let settler = Address::generate(&env);
+        client.set_settler(&settler);
+
+        let (asset, asset_admin) = create_token(&env, &Address::generate(&env));
+        let token = soroban_sdk::token::Client::new(&env, &asset);
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        asset_admin.mint(&p1, &1000);
+        asset_admin.mint(&p2, &1000);
+
+        let m = Symbol::new(&env, "m1");
+        client.stake(&m, &p1, &300, &asset);
+        assert_eq!(
+            client.try_release(&m, &settler),
+            Err(Ok(Error::NotEnoughPlayers))
+        );
+        client.stake(&m, &p2, &300, &asset);
+
+        let (a, pot) = client.release(&m, &settler);
+        assert_eq!((a, pot), (asset.clone(), 600));
+        assert_eq!(token.balance(&settler), 600);
+        assert_eq!(client.get_total_escrow(), 0);
+        assert_eq!(
+            client.try_release(&m, &settler),
+            Err(Ok(Error::AlreadyReleased))
+        );
+
+        // Stakes are gone, so no one can also claim a timeout refund.
+        env.ledger()
+            .with_mut(|l| l.timestamp += LEDGER_TIMEOUT_SECS + 1);
+        assert!(client.try_timeout_refund(&m, &p1, &p1, &asset).is_err());
+    }
+
+    #[test]
     fn test_pause_blocks_stake() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let client = EscrowContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
