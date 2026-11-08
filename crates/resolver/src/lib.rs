@@ -1,6 +1,10 @@
 #![no_std]
+// Events still use `env.events().publish`; migrating to `#[contractevent]` types is tracked as an open issue.
+#![allow(deprecated)]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol,
+};
 
 pub const DISPUTE_WINDOW_SECS: u64 = 86400; // 24 hours
 
@@ -21,6 +25,11 @@ pub enum Error {
     DisputeWindowOpen = 8,
     NoEvidence = 9,
     Unauthorized = 10,
+    NotOracle = 11,
+    Disputed = 12,
+    NotDisputed = 13,
+    InvalidWinner = 14,
+    SamePlayer = 15,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +57,8 @@ pub struct GameResult {
 pub enum DataKey {
     Admin,
     IsPaused,
+    /// Registered result oracles (e.g. a Lichess result relayer).
+    Oracle(Address),
 }
 
 #[contract]
@@ -117,6 +128,20 @@ impl ResolverContract {
         submitter.require_auth();
         require_not_paused(&env)?;
 
+        // Only registered oracles may report results; otherwise anyone could
+        // front-run the real result for any match ID.
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Oracle(submitter.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotOracle);
+        }
+        if winner == loser {
+            return Err(Error::SamePlayer);
+        }
+
         let rkey = result_key(&env, &match_id);
         if env.storage().persistent().has(&rkey) {
             return Err(Error::ResultExists);
@@ -137,8 +162,10 @@ impl ResolverContract {
             .persistent()
             .extend_ttl(&rkey, BUMP_THRESHOLD, BUMP_EXTEND_TO);
 
-        env.events()
-            .publish(("result", "submitted", match_id), (winner, submitter, reason));
+        env.events().publish(
+            ("result", "submitted", match_id),
+            (winner, submitter, reason),
+        );
 
         Ok(())
     }
@@ -190,6 +217,11 @@ impl ResolverContract {
             .get(&rkey)
             .ok_or(Error::NoResult)?;
 
+        // A disputed result must be decided by the admin via `resolve_dispute`.
+        if result.status == ResultStatus::Disputed {
+            return Err(Error::Disputed);
+        }
+
         let current_time = env.ledger().timestamp();
         if current_time < result.submitted_at + DISPUTE_WINDOW_SECS {
             return Err(Error::DisputeWindowOpen);
@@ -198,16 +230,67 @@ impl ResolverContract {
         result.status = ResultStatus::Finalized;
         env.storage().persistent().set(&rkey, &result);
 
-        env.events().publish(
-            ("result", "finalized", match_id),
-            result.winner.clone(),
-        );
+        env.events()
+            .publish(("result", "finalized", match_id), result.winner.clone());
 
         Ok(result.winner)
     }
 
+    /// Decide a disputed result (admin only). `winner` must be one of the two
+    /// recorded players; if it is the original loser the result is flipped.
+    /// The result becomes final immediately.
+    pub fn resolve_dispute(env: Env, match_id: Symbol, winner: Address) -> Result<Address, Error> {
+        require_admin(&env)?;
+        let rkey = result_key(&env, &match_id);
+        let mut result: GameResult = env
+            .storage()
+            .persistent()
+            .get(&rkey)
+            .ok_or(Error::NoResult)?;
+
+        if result.status != ResultStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if winner == result.loser {
+            result.loser = result.winner.clone();
+            result.winner = winner;
+        } else if winner != result.winner {
+            return Err(Error::InvalidWinner);
+        }
+
+        result.status = ResultStatus::Finalized;
+        env.storage().persistent().set(&rkey, &result);
+        env.events()
+            .publish(("dispute", "resolved", match_id), result.winner.clone());
+        Ok(result.winner)
+    }
+
+    /// Register or remove a result oracle (admin only).
+    pub fn set_oracle(env: Env, oracle: Address, enabled: bool) -> Result<(), Error> {
+        require_admin(&env)?;
+        if enabled {
+            env.storage()
+                .instance()
+                .set(&DataKey::Oracle(oracle), &true);
+        } else {
+            env.storage().instance().remove(&DataKey::Oracle(oracle));
+        }
+        Ok(())
+    }
+
+    /// Whether an address is a registered result oracle.
+    pub fn is_oracle(env: Env, oracle: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Oracle(oracle))
+            .unwrap_or(false)
+    }
+
     /// Query the result status for a match.
-    pub fn query_result_status(env: Env, match_id: Symbol) -> Result<(Address, ResultStatus), Error> {
+    pub fn query_result_status(
+        env: Env,
+        match_id: Symbol,
+    ) -> Result<(Address, ResultStatus), Error> {
         let rkey = result_key(&env, &match_id);
         let result: GameResult = env
             .storage()
@@ -288,7 +371,7 @@ mod tests {
     fn test_initialize() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, ResolverContract);
+        let contract_id = env.register(ResolverContract, ());
         let client = ResolverContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -299,7 +382,7 @@ mod tests {
     fn test_submit_and_finalize() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, ResolverContract);
+        let contract_id = env.register(ResolverContract, ());
         let client = ResolverContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -308,6 +391,7 @@ mod tests {
         let winner = Address::generate(&env);
         let loser = Address::generate(&env);
         let submitter = Address::generate(&env);
+        client.set_oracle(&submitter, &true);
         let match_id = Symbol::new(&env, "match1");
         let proof = Bytes::from_array(&env, &[1, 2, 3]);
 
@@ -335,7 +419,7 @@ mod tests {
     fn test_dispute_by_loser() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, ResolverContract);
+        let contract_id = env.register(ResolverContract, ());
         let client = ResolverContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
@@ -344,6 +428,7 @@ mod tests {
         let winner = Address::generate(&env);
         let loser = Address::generate(&env);
         let submitter = Address::generate(&env);
+        client.set_oracle(&submitter, &true);
         let match_id = Symbol::new(&env, "match1");
         let proof = Bytes::from_array(&env, &[1, 2, 3]);
 
@@ -362,5 +447,69 @@ mod tests {
         let (_, status) = client.query_result_status(&match_id);
         assert_eq!(status, ResultStatus::Disputed);
         assert_eq!(client.get_dispute_evidence(&match_id, &0), evidence);
+    }
+
+    fn submitted<'a>(env: &Env) -> (ResolverContractClient<'a>, Symbol, Address, Address) {
+        let client = ResolverContractClient::new(env, &env.register(ResolverContract, ()));
+        client.initialize(&Address::generate(env));
+        let oracle = Address::generate(env);
+        client.set_oracle(&oracle, &true);
+        let (winner, loser) = (Address::generate(env), Address::generate(env));
+        let m = Symbol::new(env, "m1");
+        client.submit_result(
+            &m,
+            &winner,
+            &loser,
+            &Symbol::new(env, "checkmate"),
+            &Bytes::from_array(env, &[1]),
+            &oracle,
+        );
+        (client, m, winner, loser)
+    }
+
+    #[test]
+    fn test_non_oracle_cannot_submit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = ResolverContractClient::new(&env, &env.register(ResolverContract, ()));
+        client.initialize(&Address::generate(&env));
+        let res = client.try_submit_result(
+            &Symbol::new(&env, "m1"),
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Symbol::new(&env, "checkmate"),
+            &Bytes::from_array(&env, &[1]),
+            &Address::generate(&env),
+        );
+        assert_eq!(res, Err(Ok(Error::NotOracle)));
+    }
+
+    #[test]
+    fn test_disputed_result_cannot_auto_finalize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, m, _, _) = submitted(&env);
+        client.dispute(&m, &Bytes::from_array(&env, &[9]));
+        env.ledger()
+            .with_mut(|l| l.timestamp += DISPUTE_WINDOW_SECS + 1);
+        assert_eq!(client.try_finalize(&m), Err(Ok(Error::Disputed)));
+    }
+
+    #[test]
+    fn test_admin_can_overturn_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, m, winner, loser) = submitted(&env);
+        client.dispute(&m, &Bytes::from_array(&env, &[9]));
+        assert_eq!(client.resolve_dispute(&m, &loser), loser);
+        let r = client.get_result(&m);
+        assert_eq!(
+            (r.winner, r.loser, r.status),
+            (loser, winner, ResultStatus::Finalized)
+        );
+        assert_eq!(
+            client.try_resolve_dispute(&m, &Address::generate(&env)),
+            Err(Ok(Error::NotDisputed))
+        );
     }
 }
